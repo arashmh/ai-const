@@ -1,0 +1,6 @@
+{
+  "name": "AI Constitution Simulator",
+  "description": "An application to create a society of AI agents and simulate the emergence of a constitution. Define agent profiles, launch experiments, and observe how laws are proposed, debated, and ratified in a digital government.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
