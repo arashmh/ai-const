@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { Question, Answer } from '../types';
 import { CONSTITUTION_QUESTIONS } from '../constants';
@@ -43,7 +44,7 @@ const Questionnaire: React.FC<QuestionnaireProps> = ({ onComplete, onCancel }) =
         <div className="p-8">
           <div className="mb-6">
             <h2 className="text-2xl font-bold text-brand-text mb-2">Create New AI Member</h2>
-            <p className="text-brand-light">Complete the Cognitive & Ethical Profile to craft a new member of society.</p>
+            <p className="text-brand-light">Complete the Character Profile to craft a new member of society.</p>
             <div className="w-full bg-brand-accent rounded-full h-2.5 mt-4">
               <div className="bg-brand-blue h-2.5 rounded-full" style={{ width: `${progress}%`, transition: 'width 0.5s ease-in-out' }}></div>
             </div>

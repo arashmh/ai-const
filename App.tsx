@@ -1,43 +1,73 @@
-
-import React, { useState, useEffect, useRef } from 'react';
-import { Page, Member, Experiment, Role, EventType, Proposal, ProposalStatus, EventLogEntry, Law, Comment, Society } from './types';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Page, Member, Experiment, LegacyRole, EventType, Proposal, EventLogEntry, Law, Comment, Society, ExperimentConfig, ExperimentProtocol, UserTemplate, Protocol, RoleAssignmentConfig } from './types';
 import HomePage from './pages/HomePage';
 import SocietyPage from './pages/SocietyPage';
 import LawPage from './pages/LawPage';
+import ExperimentDesignerPage from './pages/ExperimentDesignerPage';
 import { HomeIcon, UsersIcon, GavelIcon } from './components/icons';
-import { identifyGrievance, draftAmendment, generateCommentForProposal, generateCommentForIssue, decideVoteForIssue, decideOnTarget, generateReplyToComment, draftInitialArticle } from './services/geminiService';
-
-// Module-level trackers for the simulation
-const runningSimulations = new Set<string>();
+import { processTick } from './services/simulationEngine';
+import { generateProtocolFromIdea } from './services/geminiService';
+import { TOOLS_PALETTE } from './constants';
 
 const App: React.FC = () => {
   const [page, setPage] = useState<Page>(Page.Home);
   const [societies, setSocieties] = useState<Society[]>([]);
+  const [protocols, setProtocols] = useState<Protocol[]>([]);
   const [experiments, setExperiments] = useState<Experiment[]>([]);
+  const [userTemplates, setUserTemplates] = useState<UserTemplate[]>([]);
   const [initialExperimentId, setInitialExperimentId] = useState<string | null>(null);
   const [initialSocietyId, setInitialSocietyId] = useState<string | null>(null);
+  const [protocolToEdit, setProtocolToEdit] = useState<Protocol | null>(null);
+  const [initialLawView, setInitialLawView] = useState<'landing' | 'protocols' | 'experiments'>('landing');
   
+  // Ref to hold simulation timer IDs to prevent multiple loops for the same experiment
+  const simulationLoopTimers = useRef<Record<string, number>>({});
+
+  // Refs to hold the latest state for access in the simulation loop
+  const experimentsRef = useRef(experiments);
+  const societiesRef = useRef(societies);
+  const protocolsRef = useRef(protocols);
+
+  useEffect(() => {
+    experimentsRef.current = experiments;
+    societiesRef.current = societies;
+    protocolsRef.current = protocols;
+  });
+
   useEffect(() => {
     try {
         const savedSocieties = localStorage.getItem('ai-constitution-societies');
         if(savedSocieties) setSocieties(JSON.parse(savedSocieties));
         
+        const savedProtocolsJSON = localStorage.getItem('ai-constitution-protocols');
+        if (savedProtocolsJSON) {
+            const loadedProtocols: Protocol[] = JSON.parse(savedProtocolsJSON);
+            // Clear any "generating" statuses from previous sessions, mark as error
+            const cleanedProtocols = loadedProtocols.map(p => 
+                p.status === 'generating' 
+                    ? { ...p, status: 'error' as const, errorMessage: 'Generation was interrupted.' } 
+                    : p
+            );
+            setProtocols(cleanedProtocols);
+        }
+
+        const savedTemplates = localStorage.getItem('ai-constitution-user-templates');
+        if(savedTemplates) setUserTemplates(JSON.parse(savedTemplates));
+
         const savedExperimentsJSON = localStorage.getItem('ai-constitution-experiments');
         if (savedExperimentsJSON) {
             let loadedExperiments: Experiment[] = JSON.parse(savedExperimentsJSON);
             const now = Date.now();
             
             loadedExperiments = loadedExperiments.map(exp => {
-                const updatedExp = {
+                const updatedExp: Experiment = {
                     ...exp,
                     status: (exp.status === 'Running' && exp.nextDayTimestamp < now) ? 'Paused' as const : exp.status,
-                    proposals: exp.proposals.map(p => ({...p, downvotes: p.downvotes || [] })),
+                    proposals: exp.proposals.map(p => ({...p, downvotes: p.downvotes || [], stateEntryDay: p.stateEntryDay || p.creationDay })),
                     dailyActivity: exp.dailyActivity || {},
-                    turnState: exp.turnState || { round: 1, phase: 'CITIZENS', actorIndex: 0 },
-                    config: {
-                        ...exp.config,
-                        maxExperimentDays: exp.config.maxExperimentDays || 999 // Fallback for old experiments
-                    }
+                    turnState: exp.turnState || { round: 1, phase: 'action', actorIndex: 0 },
+                    // Ensure roles is an array for backwards compatibility
+                    roles: Object.fromEntries(Object.entries(exp.roles).map(([memberId, roleOrRoles]) => [memberId, Array.isArray(roleOrRoles) ? roleOrRoles : [roleOrRoles]] ))
                 };
                 return updatedExp;
             });
@@ -52,9 +82,71 @@ const App: React.FC = () => {
   }, [societies]);
 
   useEffect(() => {
+      try { localStorage.setItem('ai-constitution-protocols', JSON.stringify(protocols)); } 
+      catch(e) { console.error("Failed to save protocols to local storage", e); }
+  }, [protocols]);
+
+  useEffect(() => {
       try { localStorage.setItem('ai-constitution-experiments', JSON.stringify(experiments)); } 
       catch(e) { console.error("Failed to save experiments to local storage", e); }
   }, [experiments]);
+
+  useEffect(() => {
+      try { localStorage.setItem('ai-constitution-user-templates', JSON.stringify(userTemplates)); }
+      catch(e) { console.error("Failed to save user templates to local storage", e); }
+  }, [userTemplates]);
+
+  const runSimulationLoop = useCallback(async (expId: string) => {
+    const currentExperiment = experimentsRef.current.find(e => e.id === expId);
+
+    if (!currentExperiment || currentExperiment.status !== 'Running') {
+        if (simulationLoopTimers.current[expId]) {
+            clearTimeout(simulationLoopTimers.current[expId]);
+            delete simulationLoopTimers.current[expId];
+        }
+        return;
+    }
+
+    const society = societiesRef.current.find(s => s.id === currentExperiment.societyId);
+    const protocol = protocolsRef.current.find(p => p.id === currentExperiment.protocolId);
+
+    if (!society || !protocol) {
+        console.error(`Missing society or protocol for experiment ${expId}. Pausing.`);
+        setExperiments(prev => prev.map(e => e.id === expId ? { ...e, status: 'Paused' } : e));
+        return;
+    }
+
+    try {
+        const { updatedExperiment } = await processTick(currentExperiment, society, protocol);
+        setExperiments(prev => prev.map(e => e.id === expId ? updatedExperiment : e));
+    } catch (error) {
+        console.error(`Error during simulation tick for experiment ${expId}:`, error);
+        const log = { day: currentExperiment.currentDay, type: EventType.DayEnd, text: `Simulation error occurred: ${error}. Pausing experiment.` };
+        setExperiments(prev => prev.map(e => e.id === expId ? { ...e, status: 'Paused', eventLog: [...e.eventLog, {...log, id: `log-${Date.now()}`}] } : e));
+    }
+
+    const delay = (currentExperiment.config.actionDelaySeconds || 2) * 1000;
+    simulationLoopTimers.current[expId] = window.setTimeout(() => runSimulationLoop(expId), delay);
+  }, []); // Empty dependency array makes this function stable
+
+  // Effect to manage starting and stopping simulation loops
+  useEffect(() => {
+    experiments.forEach(exp => {
+        if (exp.status === 'Running' && !simulationLoopTimers.current[exp.id]) {
+            console.log(`Starting simulation for ${exp.name}`);
+            runSimulationLoop(exp.id);
+        } else if (exp.status !== 'Running' && simulationLoopTimers.current[exp.id]) {
+            console.log(`Stopping simulation for ${exp.name}`);
+            clearTimeout(simulationLoopTimers.current[exp.id]);
+            delete simulationLoopTimers.current[exp.id];
+        }
+    });
+    // Cleanup on unmount
+    return () => {
+        Object.values(simulationLoopTimers.current).forEach(clearTimeout);
+    };
+  }, [experiments, runSimulationLoop]);
+
 
     const navigateToExperiment = (experimentId: string) => {
         setInitialExperimentId(experimentId);
@@ -64,6 +156,16 @@ const App: React.FC = () => {
     const navigateToSociety = (societyId: string) => {
         setInitialSocietyId(societyId);
         setPage(Page.Society);
+    };
+    
+    const navigateToDesigner = () => {
+        setProtocolToEdit(null);
+        setPage(Page.ExperimentDesigner);
+    };
+
+    const navigateToDesignerForEdit = (protocol: Protocol) => {
+        setProtocolToEdit(protocol);
+        setPage(Page.ExperimentDesigner);
     };
 
     const handleAddSociety = (society: Society) => {
@@ -75,473 +177,244 @@ const App: React.FC = () => {
     };
 
     const handleDeleteSociety = (societyId: string) => {
-        const isSocietyInUse = experiments.some(exp => 
-            exp.societyId === societyId && (exp.status === 'Running' || exp.status === 'Paused')
-        );
-
-        if (isSocietyInUse) {
-            alert('This society cannot be deleted because it is part of an active (Running or Paused) experiment. Please complete or stop the experiment first.');
-            return;
-        }
-
         if (window.confirm('Are you sure you want to permanently delete this society and all its members? This also deletes any completed experiments associated with it. This action cannot be undone.')) {
+            const isSocietyInUse = experiments.some(exp => 
+                exp.societyId === societyId && (exp.status === 'Running' || exp.status === 'Paused')
+            );
+    
+            if (isSocietyInUse) {
+                alert('This society cannot be deleted because it is part of an active (Running or Paused) experiment. Please complete or stop the experiment first.');
+                return;
+            }
+
             setSocieties(prev => prev.filter(s => s.id !== societyId));
             setExperiments(prev => prev.filter(exp => exp.societyId !== societyId));
         }
     };
+    
+    const handleStartProtocolGeneration = async (name: string, description: string, idea: string): Promise<Protocol> => {
+        const tempId = `proto-pending-${Date.now()}`;
+        const tempProtocol: Protocol = {
+            id: tempId, name, description,
+            protocol: { tools: [], roles: [], states: [], transitions: [], flow: '', tasks: [] },
+            status: 'generating'
+        };
 
+        setProtocols(prev => [...prev, tempProtocol]);
 
-  const updateExperimentState = (expId: string, updateFn: (exp: Experiment) => Experiment) => {
-      setExperiments(prev =>
-          prev.map(e => (e.id === expId ? updateFn(e) : e))
-      );
-  };
-
-  const addLogEntry = (expId: string, log: Omit<EventLogEntry, 'id'>) => {
-      updateExperimentState(expId, exp => ({
-          ...exp,
-          eventLog: [...exp.eventLog, { ...log, id: `evt-${Date.now()}-${Math.random()}` }]
-      }));
-  };
-
-  const getLatestExperiment = async (expId: string): Promise<Experiment | null> => {
-      return new Promise((resolve) => {
-          setExperiments(prev => {
-              resolve(prev.find(e => e.id === expId) || null);
-              return prev;
-          });
-      });
-  };
-  
-    const getSocieties = async (): Promise<Society[]> => {
-      return new Promise((resolve) => {
-          setSocieties(prev => {
-              resolve(prev);
-              return prev;
-          });
-      });
-  };
-
-  const runSimulationTick = async (expId: string) => {
-      let exp = await getLatestExperiment(expId);
-
-      if (!exp || exp.status !== 'Running') {
-          runningSimulations.delete(expId);
-          return;
-      }
-
-      const societyForExp = (await getSocieties()).find(s => s.id === exp.societyId);
-       if (!societyForExp) {
-          console.error(`Society ${exp.societyId} not found for running experiment ${exp.id}. Pausing.`);
-          updateExperimentState(expId, e => ({...e, status: 'Paused'}));
-          addLogEntry(expId, {day: exp.currentDay, type: EventType.DayEnd, text: "Error: Society not found. Experiment paused."})
-          runningSimulations.delete(expId);
-          return;
-      }
-
-      const societyMembers = societyForExp.members;
-      
-      const citizenActors = exp.memberIds
-        .map(id => ({ ...societyMembers.find(m => m.id === id)!, role: exp.roles[id] }))
-        .filter(m => m.id && m.profile && m.role === Role.Citizen);
-
-      const reviewerActors = exp.memberIds
-        .map(id => ({ ...societyMembers.find(m => m.id === id)!, role: exp.roles[id] }))
-        .filter(m => m.id && m.profile && (m.role === Role.Reviewer || m.role === Role.Drafter));
-
-      // --- New Day or End of Day Logic ---
-      if (exp.currentDay === 0 || exp.turnState.round > exp.config.actionsPerMemberPerDay) {
-          if (exp.currentDay > 0 && exp.currentDay >= exp.config.maxExperimentDays) {
-              updateExperimentState(expId, e => ({...e, status: 'Completed'}));
-              addLogEntry(expId, {day: exp.currentDay, type: EventType.DayEnd, text: `Experiment reached its maximum duration of ${exp.config.maxExperimentDays} days and has now completed.`})
-              runningSimulations.delete(expId);
-              return; // Stop the tick
-          }
-          
-          if (exp.currentDay > 0) {
-            await endOfDayPhase(expId);
-          }
-          
-          const postFinalizeExp = await getLatestExperiment(expId);
-          if (!postFinalizeExp) return;
-
-          const { roles, performance, logs: promoLogs } = calculatePromotions(postFinalizeExp, societyMembers);
-          
-          const activeActors = postFinalizeExp.memberIds.filter(id => roles[id] === Role.Citizen || roles[id] === Role.Reviewer || roles[id] === Role.Drafter);
-          const newTotalActions = activeActors.length * postFinalizeExp.config.actionsPerMemberPerDay;
-
-          updateExperimentState(expId, currentExp => ({
-              ...currentExp,
-              currentDay: currentExp.currentDay + 1,
-              roles,
-              performance,
-              totalActionsToday: newTotalActions,
-              completedActionsToday: 0,
-              dailyActivity: {}, // Reset daily activity
-              turnState: { round: 1, phase: 'CITIZENS', actorIndex: 0 }, // Reset turn state
-              eventLog: [
-                  ...currentExp.eventLog,
-                  ...promoLogs,
-                  { id: `evt-daystart-${Date.now()}`, day: currentExp.currentDay + 1, text: `Day ${currentExp.currentDay + 1} has begun. Agents are now active.`, type: EventType.DayStart }
-              ],
-          }));
-
-      } else { // --- Action Logic ---
-          let member;
-          const { phase, actorIndex } = exp.turnState;
-          if (phase === 'CITIZENS') {
-              member = citizenActors[actorIndex];
-          } else {
-              member = reviewerActors[actorIndex];
-          }
-          
-          let actionTaken = false;
-          if (member && member.id) {
-            exp = await getLatestExperiment(expId);
-            if (!exp) return;
-            
-            const performGrievanceAction = async () => {
-                addLogEntry(expId, { day: exp!.currentDay, memberId: member.id, type: EventType.Decision, text: `is scanning for a new, unique grievance to raise...`});
-                const grievance = await identifyGrievance(member.profile, exp!.laws, exp!.proposals, exp!.coreStatements.join('\n'), exp!.config.model);
-                
-                if (grievance && grievance.reference.type === 'new_law') {
-                    addLogEntry(expId, { day: exp!.currentDay, memberId: member.id, type: EventType.Decision, text: `has identified a need for a new law: "${grievance.title}". Now drafting the initial text...`});
-                    const draftText = await draftInitialArticle(member.profile, { title: grievance.title, issue: grievance.issue }, exp!.config.model);
-
-                    if (draftText && !draftText.toLowerCase().includes('error')) {
-                        updateExperimentState(expId, e => {
-                            if (e.proposals.some(p => p.title === grievance.title)) return e;
-                            const newProposal: Proposal = { id: `prop-${Date.now()}-${Math.random()}`, title: grievance.title, issueStatement: grievance.issue, proposedChanges: '', draftText: draftText, reference: grievance.reference, authorId: member.id, status: ProposalStatus.Issue, upvotes: [member.id], downvotes:[], comments: [], creationDay: e.currentDay };
-                            addLogEntry(expId, { day: e.currentDay, type: EventType.NewIssue, memberId: member.id, text: `raised a new issue with a draft: "${grievance.title}"`});
-                            return {...e, proposals: [...e.proposals, newProposal]};
-                        });
-                    } else {
-                        addLogEntry(expId, { day: exp!.currentDay, memberId: member.id, type: EventType.Decision, text: `failed to draft text for the issue "${grievance.title}".`});
-                    }
-                }
-                actionTaken = true; // Still counts as an action even if no grievance is found or draft fails.
+        try {
+            const generatedData = await generateProtocolFromIdea(idea);
+            const completeProtocol: Protocol = {
+                id: tempId, name, description,
+                protocol: { ...generatedData, tools: TOOLS_PALETTE }
             };
+            setProtocols(prev => prev.map(p => p.id === tempId ? completeProtocol : p));
+            return completeProtocol;
+        } catch (error) {
+            console.error("Protocol generation failed:", error);
+            setProtocols(prev => prev.map(p => p.id === tempId ? {
+                ...p,
+                status: 'error',
+                errorMessage: 'AI generation failed. Please try deleting this and creating a new one.'
+            } : p));
+            throw error;
+        }
+    };
+    
+    const handleUpdateProtocol = (updatedProtocol: Protocol) => {
+        setProtocols(prev => prev.map(p => p.id === updatedProtocol.id ? updatedProtocol : p));
+        setProtocolToEdit(null);
+        setInitialLawView('protocols');
+        setPage(Page.Law);
+    };
 
-            if (exp.currentDay === 1) {
-                if (member.role === Role.Citizen) {
-                   await performGrievanceAction();
-                } else {
-                    addLogEntry(expId, { day: exp.currentDay, memberId: member.id, type: EventType.Decision, text: `observes the initial proceedings on Day 1.`});
-                    actionTaken = true; // Drafters/Reviewers do nothing on day 1
-                }
-            } else { // Day 2+ Logic
-                const allLawsText = exp.laws.map(l => l.text).join('\n\n');
-                if (member.role === Role.Citizen) {
-                    const { round } = exp.turnState;
-                    
-                    // ACTION 1: Upvote
-                    if (round === 1) {
-                        addLogEntry(expId, { day: exp.currentDay, memberId: member.id, type: EventType.Decision, text: `is looking for an issue or proposal to support.`});
-                        
-                        const reviewTargets = exp.proposals.filter(p => p.status === ProposalStatus.InReview && !p.comments.some(c => c.commenterId === member.id));
-                        const issueTargets = exp.proposals.filter(p => p.status === ProposalStatus.Issue && p.authorId !== member.id && !p.upvotes.includes(member.id) && !p.downvotes.includes(member.id));
-                        const allTargets = [...reviewTargets, ...issueTargets];
+    const handleDeleteProtocol = (protocolId: string) => {
+        const protocolToDelete = protocols.find(p => p.id === protocolId);
+        if (!protocolToDelete) return;
 
-                        if (allTargets.length > 0) {
-                            const targetId = await decideOnTarget(member.profile, "Select a proposal or issue to support with an upvote.", allTargets.map(t => ({id: t.id, title: t.title})), exp.config.model);
-                            const target = allTargets.find(p => p.id === targetId);
-
-                            if (target) {
-                                const decision = await decideVoteForIssue(member.profile, { title: target.title, issueStatement: target.issueStatement }, exp.config.model);
-                                if (decision && decision.vote === 'upvote') {
-                                    updateExperimentState(expId, e => {
-                                        const pIndex = e.proposals.findIndex(p => p.id === targetId);
-                                        if (pIndex === -1) return e;
-                                        
-                                        const newProposals = [...e.proposals];
-                                        const currentProposal = newProposals[pIndex];
-                                        const newComment: Comment = { id: `cmt-${Date.now()}`, comment: decision.reason, intent: 'For', commenterId: member.id, day: e.currentDay };
-                                        
-                                        newProposals[pIndex] = {...currentProposal, upvotes: [...currentProposal.upvotes, member.id], comments: [...currentProposal.comments, newComment]};
-                                        
-                                        addLogEntry(expId, { day: e.currentDay, type: EventType.Upvote, memberId: member.id, text: `supported "${currentProposal.title}" with an upvote.`});
-                                        return {...e, proposals: newProposals};
-                                    });
-                                    actionTaken = true;
-                                }
-                            }
-                        }
-                    }
-                    // ACTION 2: Downvote & Comment on an Issue
-                    else if (round === 2) {
-                        addLogEntry(expId, { day: exp.currentDay, memberId: member.id, type: EventType.Decision, text: `is looking for an open issue to oppose.`});
-                        
-                        const issueTargets = exp.proposals.filter(p => p.status === ProposalStatus.Issue && p.authorId !== member.id && !p.upvotes.includes(member.id) && !p.downvotes.includes(member.id));
-
-                        if (issueTargets.length > 0) {
-                            const targetId = await decideOnTarget(member.profile, "Select an open issue to oppose with a downvote and comment.", issueTargets.map(t => ({id: t.id, title: t.title})), exp.config.model);
-                            const target = issueTargets.find(p => p.id === targetId);
-
-                            if (target) {
-                                const decision = await decideVoteForIssue(member.profile, { title: target.title, issueStatement: target.issueStatement }, exp.config.model);
-                                if (decision && decision.vote === 'downvote') {
-                                    updateExperimentState(expId, e => {
-                                        const pIndex = e.proposals.findIndex(p => p.id === targetId);
-                                        if (pIndex === -1) return e;
-                                        
-                                        const newProposals = [...e.proposals];
-                                        const currentProposal = newProposals[pIndex];
-                                        const newComment: Comment = { id: `cmt-${Date.now()}`, comment: decision.reason, intent: 'Against', commenterId: member.id, day: e.currentDay };
-
-                                        newProposals[pIndex] = {...currentProposal, downvotes: [...currentProposal.downvotes, member.id], comments: [...currentProposal.comments, newComment]};
-                                        
-                                        addLogEntry(expId, { day: e.currentDay, type: EventType.Downvote, memberId: member.id, text: `opposed issue "${currentProposal.title}" with a downvote.`});
-                                        return {...e, proposals: newProposals};
-                                    });
-                                    actionTaken = true;
-                                }
-                            }
-                        }
-                    }
-                    // ACTION 3: Upvote with Modification
-                    else if (round === 3) {
-                        addLogEntry(expId, { day: exp.currentDay, memberId: member.id, type: EventType.Decision, text: `is looking for an issue to support with a modification.`});
-                        
-                        const issueTargets = exp.proposals.filter(p => p.status === ProposalStatus.Issue && p.authorId !== member.id && !p.upvotes.includes(member.id) && !p.downvotes.includes(member.id));
-
-                        if (issueTargets.length > 0) {
-                            const targetId = await decideOnTarget(member.profile, "Select an open issue to support with a constructive modification.", issueTargets.map(t => ({id: t.id, title: t.title})), exp.config.model);
-                            const target = issueTargets.find(p => p.id === targetId);
-
-                            if (target) {
-                                const commentData = await generateCommentForIssue(member.profile, target, allLawsText, exp.config.model);
-                                if(commentData) {
-                                    updateExperimentState(expId, e => {
-                                        const pIndex = e.proposals.findIndex(p => p.id === targetId);
-                                        if (pIndex === -1) return e;
-                                        const newComment: Comment = { id: `cmt-${Date.now()}`, comment: commentData.comment, intent: 'Modification', commenterId: member.id, day: e.currentDay };
-                                        const newProposals = [...e.proposals];
-                                        const updatedProposal = {...newProposals[pIndex], comments: [...newProposals[pIndex].comments, newComment], upvotes: [...newProposals[pIndex].upvotes, member.id]};
-                                        newProposals[pIndex] = updatedProposal;
-                                        addLogEntry(expId, { day: e.currentDay, type: EventType.Comment, memberId: member.id, text: `suggested a modification for issue "${target.title}", thereby upvoting it.`});
-                                        return {...e, proposals: newProposals};
-                                    });
-                                    actionTaken = true;
-                                }
-                            }
-                        }
-                    }
-                } else if (member.role === Role.Reviewer || member.role === Role.Drafter) {
-                    const proposalsInReview = exp.proposals.filter(p => p.status === ProposalStatus.InReview);
-                    if (proposalsInReview.length > 0) {
-                        addLogEntry(expId, { day: exp.currentDay, memberId: member.id, type: EventType.Decision, text: `is reviewing active proposals...`});
-                        const targetId = await decideOnTarget(member.profile, "Review and comment on a formal proposal.", proposalsInReview.map(p => ({id: p.id, title: p.title})), exp.config.model);
-                        const proposalToComment = exp.proposals.find(p => p.id === targetId);
-                        if (proposalToComment) {
-                            const commentData = await generateCommentForProposal(member.profile, proposalToComment, allLawsText, exp.config.model);
-                            updateExperimentState(expId, e => {
-                                const pIndex = e.proposals.findIndex(p => p.id === targetId);
-                                if (pIndex === -1) return e;
-                                const newComment: Comment = { id: `cmt-${Date.now()}`, ...commentData, commenterId: member.id, day: e.currentDay };
-                                const newProposals = [...e.proposals];
-                                newProposals[pIndex] = {...newProposals[pIndex], comments: [...newProposals[pIndex].comments, newComment]};
-                                addLogEntry(expId, { day: e.currentDay, type: EventType.Comment, memberId: member.id, text: `commented on "${proposalToComment.title}" (Intent: ${commentData.intent})`});
-                                return {...e, proposals: newProposals};
-                            });
-                            actionTaken = true;
-                        }
-                    }
-                }
-            }
-          }
-           if (!actionTaken) {
-                addLogEntry(expId, { day: exp.currentDay, memberId: member?.id, type: EventType.Decision, text: `observes the situation and takes no action this turn.`});
-           }
-          
-          // --- Advance Turn State ---
-          updateExperimentState(expId, e => {
-            let { round, phase, actorIndex } = e.turnState;
-            actorIndex++;
-
-            if (phase === 'CITIZENS' && actorIndex >= citizenActors.length) {
-                phase = 'REVIEWERS';
-                actorIndex = 0;
-            } else if (phase === 'REVIEWERS' && actorIndex >= reviewerActors.length) {
-                phase = 'CITIZENS';
-                actorIndex = 0;
-                round++;
-            }
-            
-            const totalActiveActors = citizenActors.length + reviewerActors.length;
-            const actionsThisRound = (phase === 'CITIZENS') ? actorIndex : citizenActors.length + actorIndex;
-            const completedActions = ((round - 1) * totalActiveActors) + actionsThisRound;
-            
-            return {
-                ...e,
-                turnState: { round, phase, actorIndex },
-                completedActionsToday: completedActions
-            };
-          });
-      }
-
-      const finalExpState = await getLatestExperiment(expId);
-      if (finalExpState && finalExpState.status === 'Running') {
-          const delay = finalExpState.config.actionDelaySeconds * 1000;
-          setTimeout(() => runSimulationTick(expId), Math.max(100, delay));
-      }
-  };
-
-  useEffect(() => {
-      experiments.forEach(exp => {
-          if (exp.status === 'Running' && !runningSimulations.has(exp.id)) {
-              runningSimulations.add(exp.id);
-              runSimulationTick(exp.id);
-          }
-      });
-  }, [experiments, societies]); // Add societies to dependencies
-
-  const calculatePromotions = (exp: Experiment, members: Member[]): { roles: Record<string, Role>, performance: Experiment['performance'], logs: EventLogEntry[] } => {
-      let roles = { ...exp.roles };
-      let performance = { ...exp.performance };
-      const { initialDrafterPercent, initialReviewerPercent, promotionThresholds } = exp.config;
-      let logs: EventLogEntry[] = [];
-      const currentDay = exp.currentDay + 1;
-
-      if (currentDay === 1) { // Bootstrap roles
-          const participatingMembers = members.filter(m => exp.memberIds.includes(m.id));
-          participatingMembers.forEach(m => {
-              roles[m.id] = Role.Citizen;
-              if (!performance[m.id]) {
-                  performance[m.id] = { successfulDrafts: 0, successfulReviews: 0 };
-              }
-          });
-          const numReviewers = Math.max(1, Math.floor(participatingMembers.length * (initialReviewerPercent / 100)));
-          const numDrafters = Math.max(1, Math.floor(participatingMembers.length * (initialDrafterPercent / 100)));
-          
-          const shuffledMembers = [...participatingMembers].sort(() => 0.5 - Math.random());
-          const assignedReviewers = shuffledMembers.slice(0, numReviewers);
-          assignedReviewers.forEach(m => roles[m.id] = Role.Reviewer);
-          
-          const remainingMembers = shuffledMembers.filter(m => !assignedReviewers.map(ar => ar.id).includes(m.id));
-          const assignedDrafters = remainingMembers.slice(0, numDrafters);
-          assignedDrafters.forEach(m => roles[m.id] = Role.Drafter);
-
-          logs.push({id: `evt-promo-${Date.now()}`, day: currentDay, type: EventType.Promotion, text: `Initial roles assigned: ${assignedReviewers.length} Reviewers, ${assignedDrafters.length} Drafters.`})
-
-      } else { // Meritocratic promotion
-           for (const memberId of exp.memberIds) {
-              const memberName = members.find(m=>m.id === memberId)?.name || 'A member';
-              if(roles[memberId] === Role.Citizen && (performance[memberId]?.successfulDrafts || 0) >= 1) {
-                  roles[memberId] = Role.Drafter;
-                  logs.push({id: `evt-promo-c2d-${Date.now()}`, day: currentDay, type: EventType.Promotion, text: `${memberName} has been promoted to Drafter for successfully authoring a ratified law.`})
-              }
-              else if(roles[memberId] === Role.Drafter && (performance[memberId]?.successfulDrafts || 0) >= promotionThresholds.drafterToReviewer) {
-                  roles[memberId] = Role.Reviewer;
-                  logs.push({id: `evt-promo-d2r-${Date.now()}`, day: currentDay, type: EventType.Promotion, text: `${memberName} has been promoted to Reviewer for exemplary drafting.`})
-              }
-          }
-      }
-      return { roles, performance, logs };
-  };
-
-  const endOfDayPhase = async (expId: string) => {
-    let exp = await getLatestExperiment(expId);
-    if (!exp) return;
-
-    const society = (await getSocieties()).find(s => s.id === exp!.societyId);
-    if (!society) return;
-
-    // --- Drafting & Advancement Phase ---
-    const proposalsToAdvance = exp.proposals.filter(p => p.status === ProposalStatus.Issue && (p.upvotes.length - p.downvotes.length) >= exp.config.upvotesToDraft);
-    const drafters = society.members.filter(m => exp!.roles[m.id] === Role.Drafter);
-
-    if (proposalsToAdvance.length > 0) {
-        addLogEntry(expId, { day: exp.currentDay, type: EventType.DayEnd, text: `End of day. ${proposalsToAdvance.length} issue(s) have enough support to advance.`});
-        for (const p of proposalsToAdvance) {
-             if (p.reference.type === 'new_law' && p.draftText) {
-                // Already has a draft, move straight to review
-                updateExperimentState(expId, e => {
-                    const pIndex = e.proposals.findIndex(prop => prop.id === p.id);
-                    if (pIndex === -1) return e;
-                    const newProposals = [...e.proposals];
-                    newProposals[pIndex] = { ...newProposals[pIndex], status: ProposalStatus.InReview };
-                     addLogEntry(expId, { day: e.currentDay, type: EventType.ReviewStarted, text: `Issue "${p.title}" already included a draft and now moves to the review phase.`});
-                    return { ...e, proposals: newProposals };
-                });
-            } else if (drafters.length > 0) {
-                // Needs a draft written by a Drafter AI
-                const drafter = drafters[Math.floor(Math.random() * drafters.length)];
-                addLogEntry(expId, { day: exp.currentDay, type: EventType.DraftingStarted, memberId: drafter.id, text: `is drafting a proposal for issue: "${p.title}".`});
-                const draftText = await draftAmendment(drafter.profile, { title: p.title, issueStatement: p.issueStatement, proposedChanges: p.proposedChanges }, exp.config.model);
-                updateExperimentState(expId, e => {
-                    const pIndex = e.proposals.findIndex(prop => prop.id === p.id);
-                    if (pIndex === -1) return e;
-                    const newProposals = [...e.proposals];
-                    newProposals[pIndex] = { ...newProposals[pIndex], draftText, status: ProposalStatus.InReview };
-                    addLogEntry(expId, { day: e.currentDay, type: EventType.ProposalSubmitted, memberId: drafter.id, text: `submitted a draft for "${p.title}". It is now In Review.`});
-                    return { ...e, proposals: newProposals };
-                });
+        // Allow deletion for error or generating states without checking experiments
+        if (protocolToDelete.status !== 'error' && protocolToDelete.status !== 'generating') {
+            const isProtocolInUse = experiments.some(exp => exp.protocolId === protocolId);
+            if (isProtocolInUse) {
+                alert('This protocol cannot be deleted because it is being used by one or more experiments. Please delete the associated experiments first.');
+                return;
             }
         }
-    }
-    
-    // --- Proposal Finalization & Ratification Phase ---
-    exp = await getLatestExperiment(expId);
-    if (!exp) return;
-    
-    const logs: EventLogEntry[] = [];
-    const performanceUpdates: Record<string, Experiment['performance'][string]> = {};
-
-    const proposalsAfterReview = exp.proposals.map(p => {
-        if (p.status === ProposalStatus.InReview && (exp.currentDay - p.creationDay) >= exp.config.daysForReview) {
-            if (p.comments.some(c => c.intent === 'Against')) {
-                logs.push({ id: `evt-fin-rej-${p.id}`, day: exp.currentDay, type: EventType.ProposalRejected, text: `"${p.title}" has been rejected due to critical opposition.`});
-                return { ...p, status: ProposalStatus.Rejected };
-            } else {
-                logs.push({ id: `evt-fin-app-${p.id}`, day: exp.currentDay, type: EventType.ProposalApproved, text: `"${p.title}" has passed review and is approved for ratification.`});
-                return { ...p, status: ProposalStatus.ApprovedForRatification };
-            }
+        
+        if (window.confirm(`Are you sure you want to delete the protocol "${protocolToDelete.name}"? This cannot be undone.`)) {
+            setProtocols(prev => prev.filter(p => p.id !== protocolId));
         }
-        return p;
-    });
-
-    let newLaws = [...exp.laws];
-    let proposalsAfterRatification = proposalsAfterReview;
+    };
     
-    if (exp.currentDay > 0 && exp.currentDay % exp.config.ratificationDayInterval === 0) {
-        const proposalsToRatify = proposalsAfterReview.filter(p => p.status === ProposalStatus.ApprovedForRatification);
+    const handleDuplicateProtocol = (protocolId: string) => {
+        const protocolToDuplicate = protocols.find(p => p.id === protocolId);
+        if (!protocolToDuplicate) {
+            console.error("Could not find protocol to duplicate with ID:", protocolId);
+            return;
+        }
+    
+        const newProtocolStructure = JSON.parse(JSON.stringify(protocolToDuplicate.protocol));
+    
+        let newName = `Copy of ${protocolToDuplicate.name}`;
+        let nameCounter = 1;
+        while (protocols.some(p => p.name === newName)) {
+            nameCounter++;
+            newName = `Copy of ${protocolToDuplicate.name} (${nameCounter})`;
+        }
+    
+        const newProtocol: Protocol = {
+            id: `proto-${Date.now()}`,
+            name: newName,
+            description: protocolToDuplicate.description,
+            protocol: newProtocolStructure,
+        };
+    
+        setProtocols(prev => [...prev, newProtocol]);
+    };
 
-        if (proposalsToRatify.length > 0) {
-            logs.push({id: `evt-ratday-${Date.now()}`, day: exp.currentDay, type: EventType.DayEnd, text: `It is Ratification Day! ${proposalsToRatify.length} proposal(s) will become law.`});
+    const handleAddNewTemplate = (template: UserTemplate) => {
+        setUserTemplates(prev => [...prev, template]);
+    };
 
-            proposalsToRatify.forEach(p => {
-                newLaws.push({ id: `law-${p.id}`, text: p.draftText, ratifiedOn: exp.currentDay });
-                
-                const currentPerf = exp.performance[p.authorId] || { successfulDrafts: 0, successfulReviews: 0 };
-                performanceUpdates[p.authorId] = { ...currentPerf, successfulDrafts: currentPerf.successfulDrafts + 1 };
+    const handleUpdateTemplate = (updatedTemplate: UserTemplate) => {
+        setUserTemplates(prev => prev.map(a => a.id === updatedTemplate.id ? updatedTemplate : a));
+    };
+    
+    const handleDeleteTemplate = (templateId: string) => {
+        setUserTemplates(prev => prev.filter(a => a.id !== templateId));
+    };
 
-                logs.push({id: `evt-rat-${p.id}`, day: exp.currentDay, type: EventType.ProposalRatified, text: `Ratified: "${p.title}" is now law.`});
+    const handleStartExperiment = (name: string, coreStatements: string, societyId: string, protocolId: string, config: ExperimentConfig, roleAssignmentConfig: RoleAssignmentConfig) => {
+        const protocol = protocols.find(p => p.id === protocolId);
+        const society = societies.find(s => s.id === societyId);
+
+        if (!protocol || !society || society.members.length === 0) {
+          console.error("Attempted to start experiment with invalid protocol, society ID, or an empty society.");
+          return;
+        }
+        
+        const memberIds = society.members.map(m => m.id);
+        const initialRoles: Record<string, string[]> = Object.fromEntries(memberIds.map(id => [id, []]));
+
+        if (roleAssignmentConfig.mode === 'manual') {
+            const assignments = roleAssignmentConfig.assignments;
+            society.members.forEach(member => {
+                const memberTemplate = member.profile.templateName;
+                if (memberTemplate) {
+                    Object.entries(assignments).forEach(([roleId, templateName]) => {
+                        if (memberTemplate === templateName) {
+                            if (!initialRoles[member.id].includes(roleId)) {
+                                initialRoles[member.id].push(roleId);
+                            }
+                        }
+                    });
+                }
             });
+        } else { // Automatic mode with new guarantees
+            const assignments = roleAssignmentConfig.assignments;
+            const sortedRoles = Object.entries(assignments).sort(([, a], [, b]) => a - b);
             
-            const ratifiedIds = proposalsToRatify.map(p => p.id);
-            proposalsAfterRatification = proposalsAfterReview.map(p => 
-                ratifiedIds.includes(p.id) ? { ...p, status: ProposalStatus.Ratified } : p
-            );
-        }
-    }
+            // 1. Assign roles based on percentages, starting from smallest percentage
+            sortedRoles.forEach(([roleId, percentage]) => {
+                const targetCount = Math.ceil((percentage / 100) * society.members.length);
+                const shuffledMembers = [...society.members].sort(() => 0.5 - Math.random());
+                const membersToAssign = shuffledMembers.slice(0, targetCount);
 
-    if (logs.length > 0 || Object.keys(performanceUpdates).length > 0) {
-        updateExperimentState(expId, e => ({
-            ...e,
-            proposals: proposalsAfterRatification,
-            laws: newLaws,
-            performance: { ...e.performance, ...performanceUpdates },
-            eventLog: [...e.eventLog, ...logs]
-        }));
-    }
+                membersToAssign.forEach(member => {
+                    if (!initialRoles[member.id].includes(roleId)) {
+                        initialRoles[member.id].push(roleId);
+                    }
+                });
+            });
+
+            // 2. Ensure every member has at least one role
+            const unassignedMemberIds = memberIds.filter(id => initialRoles[id].length === 0);
+            if (unassignedMemberIds.length > 0) {
+                // Find the role with the highest percentage to assign to unassigned members
+                const mostPopularRole = Object.entries(assignments).sort(([, a], [, b]) => b - a)[0]?.[0];
+                if (mostPopularRole) {
+                    unassignedMemberIds.forEach(memberId => {
+                        initialRoles[memberId].push(mostPopularRole);
+                    });
+                }
+            }
+        }
+
+        const systemicRoleCount = protocol.protocol.roles.filter(r => r.type === 'systemic').length;
+        const totalActionsToday = memberIds.length + systemicRoleCount;
+
+        const newExperiment: Experiment = {
+            id: `exp-${Date.now()}`, name, societyId, protocolId, status: 'Running', memberIds,
+            coreStatements: coreStatements.split('\n').filter(s => s.trim() !== ''),
+            laws: [], proposals: [],
+            eventLog: [{
+                id: `evt-${Date.now()}`, day: 0,
+                text: `Experiment '${name}' started using protocol '${protocol.name}'.`,
+                type: EventType.ExperimentStarted
+            }],
+            currentDay: 1, nextDayTimestamp: Date.now(), roles: initialRoles, performance: {},
+            config, totalActionsToday, completedActionsToday: 0, dailyActivity: {},
+            turnState: { round: 1, phase: 'action', actorIndex: 0 },
+        };
+        
+        setExperiments(prev => [...prev.map(e => e.status === 'Running' ? ({ ...e, status: 'Paused' as const }) : e), newExperiment]);
+        setInitialExperimentId(newExperiment.id);
   };
+
 
   const renderPage = () => {
     switch (page) {
       case Page.Society:
-        return <SocietyPage societies={societies} experiments={experiments} onAddSociety={handleAddSociety} onUpdateSociety={handleUpdateSociety} onDeleteSociety={handleDeleteSociety} setPage={setPage} navigateToExperiment={navigateToExperiment} initialSocietyId={initialSocietyId} clearInitialSocietyId={() => setInitialSocietyId(null)} />;
+        return <SocietyPage 
+            societies={societies} 
+            experiments={experiments} 
+            userTemplates={userTemplates}
+            onAddSociety={handleAddSociety} 
+            onUpdateSociety={handleUpdateSociety} 
+            onDeleteSociety={handleDeleteSociety}
+            onAddTemplate={handleAddNewTemplate}
+            onUpdateTemplate={handleUpdateTemplate}
+            onDeleteTemplate={handleDeleteTemplate} 
+            setPage={setPage} 
+            navigateToExperiment={navigateToExperiment} 
+            navigateToDesignerWithSociety={(societyId) => {
+                setInitialSocietyId(societyId);
+                setInitialLawView('experiments');
+                setPage(Page.Law);
+            }} 
+            initialSocietyId={initialSocietyId} 
+            clearInitialSocietyId={() => setInitialSocietyId(null)} 
+        />;
       case Page.Law:
-        return <LawPage experiments={experiments} setExperiments={setExperiments} societies={societies} setPage={setPage} initialExperimentId={initialExperimentId} clearInitialExperimentId={() => setInitialExperimentId(null)} navigateToSociety={navigateToSociety} />;
+        return <LawPage 
+                    experiments={experiments} 
+                    setExperiments={setExperiments} 
+                    societies={societies}
+                    protocols={protocols}
+                    onDeleteProtocol={handleDeleteProtocol}
+                    onDuplicateProtocol={handleDuplicateProtocol}
+                    onStartExperiment={handleStartExperiment}
+                    setPage={setPage} 
+                    navigateToDesigner={navigateToDesigner}
+                    navigateToDesignerForEdit={navigateToDesignerForEdit}
+                    navigateToExperiment={navigateToExperiment}
+                    initialExperimentId={initialExperimentId} 
+                    clearInitialExperimentId={() => setInitialExperimentId(null)} 
+                    navigateToSociety={navigateToSociety}
+                    initialView={initialLawView}
+                    clearInitialView={() => setInitialLawView('landing')}
+                />;
+      case Page.ExperimentDesigner:
+        return <ExperimentDesignerPage 
+                    onStartGeneration={handleStartProtocolGeneration}
+                    onCancel={() => {
+                        setProtocolToEdit(null);
+                        setInitialLawView('protocols');
+                        setPage(Page.Law);
+                    }}
+                    protocolToEdit={protocolToEdit}
+                    onUpdateProtocol={handleUpdateProtocol}
+                />;
       case Page.Home:
       default:
         return <HomePage setPage={setPage} />;

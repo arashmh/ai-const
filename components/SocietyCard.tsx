@@ -1,7 +1,7 @@
+
 import React, { useMemo } from 'react';
 import { Society, Experiment } from '../types';
 import { UsersIcon, Trash2Icon, GavelIcon, ArrowRightIcon } from './icons';
-import { ARCHETYPES } from '../constants';
 
 interface SocietyCardProps {
   society: Society;
@@ -11,7 +11,7 @@ interface SocietyCardProps {
   onSelectExperiment: (experimentId: string) => void;
 }
 
-const ArchetypeBar: React.FC<{ name: string; count: number; total: number; color: string }> = ({ name, count, total, color }) => {
+const TemplateBar: React.FC<{ name: string; count: number; total: number; color: string }> = ({ name, count, total, color }) => {
     const percentage = total > 0 ? (count / total) * 100 : 0;
     return (
         <div className="flex items-center justify-between text-xs">
@@ -28,16 +28,10 @@ const SocietyCard: React.FC<SocietyCardProps> = ({ society, experiments, onSelec
   
   const composition = useMemo(() => {
     const counts: Record<string, number> = {};
-    ARCHETYPES.forEach(arch => counts[arch.name] = 0);
-    counts['Custom'] = 0;
 
     society.members.forEach(member => {
-      const archetype = member.profile.archetype || 'Custom';
-      if (counts[archetype] !== undefined) {
-        counts[archetype]++;
-      } else {
-        counts['Custom']++;
-      }
+      const template = member.profile.templateName || 'Custom';
+      counts[template] = (counts[template] || 0) + 1;
     });
 
     return Object.entries(counts)
@@ -45,7 +39,7 @@ const SocietyCard: React.FC<SocietyCardProps> = ({ society, experiments, onSelec
       .sort(([, a], [, b]) => b - a);
   }, [society.members]);
 
-  const archetypeColors = [
+  const templateColors = [
     'bg-brand-blue', 'bg-brand-green', 'bg-yellow-400', 'bg-purple-400', 'bg-pink-400', 'bg-indigo-400', 'bg-teal-400'
   ];
 
@@ -65,7 +59,7 @@ const SocietyCard: React.FC<SocietyCardProps> = ({ society, experiments, onSelec
           <Trash2Icon className="h-4 w-4" />
         </button>
         <h3 className="text-xl font-bold text-brand-text mb-2 pr-8">{society.name}</h3>
-        <p className="text-xs text-brand-light mb-4 h-16 overflow-hidden">{society.description}</p>
+        <p className="text-xs text-brand-light mb-4 h-16 overflow-hidden">{society.analysis?.composition || 'This society has not been analyzed yet.'}</p>
         
         <div className="flex items-center text-sm text-brand-light mb-4">
             <UsersIcon className="h-4 w-4 mr-2" />
@@ -76,7 +70,7 @@ const SocietyCard: React.FC<SocietyCardProps> = ({ society, experiments, onSelec
             <h4 className="text-sm font-semibold text-brand-light mb-2">Composition</h4>
             <div className="space-y-1">
                 {composition.map(([name, count], index) => (
-                    <ArchetypeBar key={name} name={name} count={count} total={society.members.length} color={archetypeColors[index % archetypeColors.length]} />
+                    <TemplateBar key={name} name={name} count={count} total={society.members.length} color={templateColors[index % templateColors.length]} />
                 ))}
             </div>
         </div>

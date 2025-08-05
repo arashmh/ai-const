@@ -1,111 +1,262 @@
 
+
+
+
+
+
+
+
 import React, { useState, useMemo, useEffect } from 'react';
-import { Member, Answer, Role, Page, Society, Experiment } from '../types';
+import { Member, Answer, LegacyRole, Page, Society, Experiment, BulkMemberConfig, UserTemplate, DefaultTemplate, CognitiveEthicalProfile } from '../types';
 import Questionnaire from '../components/Questionnaire';
 import MemberCard from '../components/MemberCard';
 import SocietyCard from '../components/SocietyCard';
-import { generateCognitiveProfile, generateBulkProfiles, generateSocietyNameAndDescription } from '../services/geminiService';
-import { PlusCircleIcon, BotIcon, UsersIcon, Trash2Icon, ChevronLeftIcon, GavelIcon, ArrowRightIcon } from '../components/icons';
-import { ARCHETYPES, Archetype } from '../constants';
+import ExpertiseDistribution from '../components/ExpertiseDistribution';
+import DefineTemplateModal from '../components/DefineTemplateModal';
+import TemplateDetailModal from '../components/TemplateDetailModal';
+import SocietyAnalysisDisplay from '../components/SocietyAnalysisDisplay';
+import { generateCognitiveProfile, generateBulkProfiles, generateSocietyAnalysis } from '../services/geminiService';
+import { PlusCircleIcon, BotIcon, UsersIcon, Trash2Icon, ChevronLeftIcon, GavelIcon, ArrowRightIcon, Wand2Icon } from '../components/icons';
+import { DEFAULT_TEMPLATES, EXPERTISE_CLUSTERS } from '../constants';
 
 interface SocietyPageProps {
   societies: Society[];
   experiments: Experiment[];
+  userTemplates: UserTemplate[];
   onAddSociety: (society: Society) => void;
   onUpdateSociety: (society: Society) => void;
   onDeleteSociety: (societyId: string) => void;
+  onAddTemplate: (template: UserTemplate) => void;
+  onUpdateTemplate: (template: UserTemplate) => void;
+  onDeleteTemplate: (templateId: string) => void;
   setPage: (page: Page) => void;
   navigateToExperiment: (experimentId: string) => void;
+  navigateToDesignerWithSociety: (societyId: string) => void;
   initialSocietyId: string | null;
   clearInitialSocietyId: () => void;
 }
 
-type CreationChoices = { type: 'bulk', counts: Record<string, number> } | { type: 'detailed', answers: Answer[] };
+const calculateDemographicSummary = (members: Member[]): { age: string, gender: string } => {
+    if (members.length === 0) {
+        return { age: 'N/A', gender: 'N/A' };
+    }
+    const maleCount = members.filter(m => m.gender === 'Male').length;
+    const femaleCount = members.length - maleCount;
+    const genderSummary = `${(maleCount / members.length * 100).toFixed(0)}% Male, ${(femaleCount / members.length * 100).toFixed(0)}% Female`;
+
+    const ageGroups: Record<string, number> = { '20-35': 0, '36-50': 0, '51-70': 0, 'Other': 0 };
+    members.forEach(m => {
+        if (m.age >= 20 && m.age <= 35) ageGroups['20-35']++;
+        else if (m.age >= 36 && m.age <= 50) ageGroups['36-50']++;
+        else if (m.age >= 51 && m.age <= 70) ageGroups['51-70']++;
+        else ageGroups['Other']++;
+    });
+    
+    const relevantAgeGroups = Object.entries(ageGroups).filter(([, count]) => count > 0);
+    if (relevantAgeGroups.length === 0) {
+        return { age: 'N/A', gender: genderSummary };
+    }
+
+    const ageSummary = relevantAgeGroups
+        .map(([range, count]) => `${range}: ${((count / members.length) * 100).toFixed(0)}%`)
+        .join(', ');
+
+    return { age: ageSummary, gender: genderSummary };
+};
+
+type CreationChoices = { type: 'bulk', counts: Record<string, number>, config: BulkMemberConfig } | { type: 'detailed', answers: Answer[] };
 
 const BulkCreateModal: React.FC<{
   onCancel: () => void;
-  onGenerate: (counts: Record<string, number>) => void;
+  onGenerate: (counts: Record<string, number>, config: BulkMemberConfig) => void;
+  userTemplates: UserTemplate[];
+  onAddTemplate: (template: UserTemplate) => void;
+  onUpdateTemplate: (template: UserTemplate) => void;
+  onDeleteTemplate: (templateId: string) => void;
   title: string;
   description: string;
-}> = ({ onCancel, onGenerate, title, description }) => {
+}> = ({ onCancel, onGenerate, userTemplates, onAddTemplate, onUpdateTemplate, title, description }) => {
   const [counts, setCounts] = useState<Record<string, number>>({});
+  const [genderRatio, setGenderRatio] = useState(50);
+  const [ageWeights, setAgeWeights] = useState<Record<string, number>>({ '20-35': 3, '36-50': 2, '51-70': 1 });
+  
+  const initialExpertiseWeights = Object.keys(EXPERTISE_CLUSTERS).reduce((acc, key) => {
+    acc[key] = 100 / Object.keys(EXPERTISE_CLUSTERS).length;
+    return acc;
+  }, {} as Record<string, number>);
+  const [expertiseWeights, setExpertiseWeights] = useState<Record<string, number>>(initialExpertiseWeights);
+  const [lockedExpertise, setLockedExpertise] = useState<Record<string, boolean>>({});
+
+  const [isDefineTemplateModalOpen, setIsDefineTemplateModalOpen] = useState(false);
+  const [isTemplateDetailModalOpen, setIsTemplateDetailModalOpen] = useState(false);
+  const [selectedTemplate, setSelectedTemplate] = useState<DefaultTemplate | UserTemplate | null>(null);
 
   const totalToGenerate = useMemo(() => {
     return Object.values(counts).reduce((sum, count) => sum + (count || 0), 0);
   }, [counts]);
 
-  const handleCountChange = (archetypeName: string, value: string) => {
+  const handleCountChange = (templateName: string, value: string) => {
     const newCount = parseInt(value, 10);
-    setCounts(prev => ({
-      ...prev,
-      [archetypeName]: isNaN(newCount) || newCount < 0 ? 0 : newCount,
-    }));
+    setCounts(prev => ({ ...prev, [templateName]: isNaN(newCount) || newCount < 0 ? 0 : newCount }));
   };
 
+  const handleAgeWeightChange = (range: string, value: string) => {
+    const newWeight = parseInt(value, 10);
+    setAgeWeights(prev => ({ ...prev, [range]: isNaN(newWeight) || newWeight < 0 ? 0 : newWeight }));
+  };
+  
   const handleSubmit = () => {
     if (totalToGenerate > 0) {
-      onGenerate(counts);
+      onGenerate(counts, { genderRatio, ageWeights, expertiseWeights });
     }
   };
 
-  return (
-    <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
-      <div className="bg-brand-secondary rounded-lg shadow-2xl w-full max-w-3xl transform transition-all">
-        <div className="p-8">
-          <h2 className="text-2xl font-bold text-brand-text mb-2">{title}</h2>
-          <p className="text-brand-light mb-6">{description}</p>
-          
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-h-[60vh] overflow-y-auto pr-3">
-            {ARCHETYPES.map((archetype) => (
-              <div key={archetype.name} className="bg-brand-primary/50 p-4 rounded-lg flex items-center space-x-4">
-                <div className="flex-shrink-0 bg-brand-accent/50 p-3 rounded-full">
-                  <archetype.icon className="h-6 w-6 text-brand-blue" />
-                </div>
-                <div className="flex-1">
-                  <h3 className="font-semibold text-brand-text">{archetype.name}</h3>
-                  <p className="text-xs text-brand-light">{archetype.description}</p>
-                </div>
-                <input
-                  type="number"
-                  min="0"
-                  value={counts[archetype.name] || ''}
-                  onChange={(e) => handleCountChange(archetype.name, e.target.value)}
-                  className="w-20 bg-brand-primary border border-brand-accent rounded-lg p-2 text-brand-text text-center focus:ring-2 focus:ring-brand-blue focus:outline-none"
-                  placeholder="0"
-                />
-              </div>
-            ))}
-          </div>
+  const handleTemplateCardClick = (template: DefaultTemplate | UserTemplate) => {
+    setSelectedTemplate(template);
+    setIsTemplateDetailModalOpen(true);
+  };
 
-          <div className="mt-8 flex justify-between items-center">
-            <button type="button" onClick={onCancel} className="text-brand-light hover:text-white">Cancel</button>
+  const allTemplates = useMemo(() => [...DEFAULT_TEMPLATES, ...userTemplates], [userTemplates]);
+  const allTemplateNames = useMemo(() => allTemplates.map(t => t.name), [allTemplates]);
+
+  return (
+    <>
+    {isDefineTemplateModalOpen && (
+        <DefineTemplateModal 
+            onClose={() => setIsDefineTemplateModalOpen(false)}
+            onSave={onAddTemplate}
+        />
+    )}
+    {isTemplateDetailModalOpen && selectedTemplate && (
+        <TemplateDetailModal
+            template={selectedTemplate}
+            onClose={() => { setIsTemplateDetailModalOpen(false); setSelectedTemplate(null); }}
+            onAddTemplate={onAddTemplate}
+            onUpdateTemplate={onUpdateTemplate}
+            allTemplateNames={allTemplateNames}
+        />
+    )}
+    <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4 animate-fade-in">
+      <div className="bg-brand-secondary rounded-lg shadow-2xl w-full max-w-7xl transform transition-all flex flex-col">
+        <div className="p-6 border-b border-brand-accent/50">
+          <h2 className="text-2xl font-bold text-brand-text mb-1">{title}</h2>
+          <p className="text-brand-light text-sm">{description}</p>
+        </div>
+        
+        <div className="flex-grow p-6 overflow-y-auto max-h-[80vh] space-y-6">
+            {/* Section 1: Member Templates */}
+            <section className="border border-brand-accent/40 rounded-lg p-4">
+                <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-xl font-semibold text-brand-text">1. Select Member Templates</h3>
+                    <button onClick={() => setIsDefineTemplateModalOpen(true)} className="flex items-center text-sm bg-brand-accent text-brand-blue font-semibold py-2 px-4 rounded-lg hover:bg-brand-light hover:text-brand-primary transition-colors">
+                        <Wand2Icon className="h-5 w-5 mr-2" />
+                        Define New Template
+                    </button>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                    {allTemplates.map((template) => (
+                        <div key={template.name} className="bg-brand-primary/50 p-3 rounded-lg flex flex-col group cursor-pointer hover:bg-brand-accent/30 transition-colors"
+                             onClick={() => handleTemplateCardClick(template)}
+                        >
+                            {/* Header */}
+                            <div className="flex-shrink-0">
+                                <div className="flex items-start space-x-3">
+                                    {'icon' in template && <div className="flex-shrink-0 bg-brand-accent/50 p-2 rounded-full mt-1"><template.icon className="h-5 w-5 text-brand-blue" /></div>}
+                                    {!('icon' in template) && <div className="flex-shrink-0 bg-brand-accent/50 p-2 rounded-full mt-1"><UsersIcon className="h-5 w-5 text-purple-400" /></div>}
+                                    <div className="flex-1">
+                                        <h4 className="font-semibold text-brand-text group-hover:text-brand-blue transition-colors">{template.name}</h4>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            {/* Body */}
+                            <div className="flex-grow my-2">
+                                <p className="text-xs text-brand-light">{template.description}</p>
+                            </div>
+
+                            {/* Footer */}
+                            <div className="flex-shrink-0 mt-auto" onClick={(e) => e.stopPropagation()}>
+                                <div className="flex items-center justify-end">
+                                    <label className="text-xs text-brand-light mr-2">Count:</label>
+                                    <input type="number" min="0" value={counts[template.name] || ''} onChange={(e) => handleCountChange(template.name, e.target.value)} className="w-20 bg-brand-primary border border-brand-accent rounded-md p-1.5 text-brand-text text-center focus:ring-2 focus:ring-brand-blue focus:outline-none" placeholder="0" />
+                                </div>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </section>
+
+            {/* Section 2: Demographics */}
+            <section className="border border-brand-accent/40 rounded-lg p-4">
+                <h3 className="text-xl font-semibold text-brand-text mb-4">2. Configure Demographics</h3>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                    <div>
+                        <label className="block text-sm font-medium text-brand-text mb-2">Gender Ratio</label>
+                        <div className="flex items-center space-x-4">
+                            <span className="text-xs text-brand-light">Male</span>
+                            <input type="range" min="0" max="100" value={genderRatio} onChange={e => setGenderRatio(Number(e.target.value))} className="w-full h-2 bg-brand-primary rounded-lg appearance-none cursor-pointer" />
+                            <span className="text-xs text-brand-light">Female</span>
+                        </div>
+                        <p className="text-center text-xs mt-1 text-brand-light">{100-genderRatio}% Male / {genderRatio}% Female</p>
+                    </div>
+                    <div>
+                        <label className="block text-sm font-medium text-brand-text mb-2">Age Distribution (Probability Weight)</label>
+                        <div className="space-y-2">
+                            {Object.entries(ageWeights).map(([range, weight]) => (
+                                <div key={range} className="flex items-center space-x-3">
+                                    <span className="text-sm text-brand-light w-16">{range}</span>
+                                    <input type="range" min="0" max="10" value={weight} onChange={e => handleAgeWeightChange(range, e.target.value)} className="w-full h-2 bg-brand-primary rounded-lg appearance-none cursor-pointer" />
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            {/* Section 3: Expertise Distribution */}
+            <section className="border border-brand-accent/40 rounded-lg p-4">
+                <h3 className="text-xl font-semibold text-brand-text mb-4">3. Configure Expertise Distribution</h3>
+                <ExpertiseDistribution 
+                    weights={expertiseWeights}
+                    setWeights={setExpertiseWeights}
+                    locked={lockedExpertise}
+                    setLocked={setLockedExpertise}
+                />
+            </section>
+        </div>
+
+        <div className="p-4 bg-brand-primary/50 mt-auto flex justify-between items-center border-t border-brand-accent/50">
+            <button type="button" onClick={onCancel} className="text-brand-light hover:text-white font-semibold">Cancel</button>
             <button
               type="button"
               onClick={handleSubmit}
               disabled={totalToGenerate === 0}
-              className="bg-brand-accent text-brand-blue font-bold py-3 px-6 text-base rounded-lg transition-colors shadow-md hover:shadow-lg hover:bg-brand-light hover:text-brand-primary disabled:bg-brand-accent/50 disabled:text-brand-light/70 disabled:cursor-not-allowed disabled:hover:bg-brand-accent/50"
+              className="bg-brand-blue text-brand-primary font-bold py-2.5 px-6 rounded-lg transition-colors shadow-md hover:shadow-lg hover:bg-opacity-90 disabled:bg-brand-accent/50 disabled:text-brand-light/70 disabled:cursor-not-allowed"
             >
               Generate {totalToGenerate > 0 ? `${totalToGenerate} Member(s)` : ''}
             </button>
-          </div>
         </div>
       </div>
     </div>
+    </>
   );
 };
 
 const CreateSocietyModal: React.FC<{
   onCancel: () => void;
   startCreation: (choices: CreationChoices) => void;
-}> = ({ onCancel, startCreation }) => {
+  userTemplates: UserTemplate[];
+  onAddTemplate: (template: UserTemplate) => void;
+  onUpdateTemplate: (template: UserTemplate) => void;
+}> = ({ onCancel, startCreation, userTemplates, onAddTemplate, onUpdateTemplate }) => {
     const [mode, setMode] = useState<'options' | 'bulk' | 'questionnaire'>('options');
 
     const handleCreateMember = (answers: Answer[]) => {
       startCreation({ type: 'detailed', answers });
     };
     
-    const handleBulkCreate = (counts: Record<string, number>) => {
-      startCreation({ type: 'bulk', counts });
+    const handleBulkCreate = (counts: Record<string, number>, config: BulkMemberConfig) => {
+      startCreation({ type: 'bulk', counts, config });
     };
     
     if (mode === 'questionnaire') {
@@ -116,8 +267,12 @@ const CreateSocietyModal: React.FC<{
         return <BulkCreateModal
             onCancel={onCancel}
             onGenerate={handleBulkCreate}
-            title="Create New Society"
-            description="Create multiple AI members at once by selecting from common archetypes."
+            userTemplates={userTemplates}
+            onAddTemplate={onAddTemplate}
+            onUpdateTemplate={onUpdateTemplate}
+            onDeleteTemplate={()=>{}} // Placeholder for now
+            title="Create New Society via Bulk Generation"
+            description="Specify the member templates and demographics for your new society's founding members."
         />
     }
 
@@ -127,18 +282,18 @@ const CreateSocietyModal: React.FC<{
                 <h2 className="text-2xl font-bold text-brand-text mb-2">Create a New Society</h2>
                 <p className="text-brand-light mb-6">How would you like to create the founding members?</p>
                 <div className="space-y-4">
-                    <button onClick={() => setMode('bulk')} className="w-full text-left bg-brand-accent hover:bg-brand-light text-brand-text font-semibold py-3 px-5 rounded-lg transition-colors flex items-center space-x-4">
-                        <UsersIcon className="h-6 w-6 text-brand-blue"/>
+                    <button onClick={() => setMode('bulk')} className="group w-full text-left bg-brand-accent hover:bg-brand-light text-brand-text hover:text-brand-primary font-semibold py-3 px-5 rounded-lg transition-colors flex items-center space-x-4">
+                        <UsersIcon className="h-6 w-6 text-brand-blue group-hover:text-brand-primary transition-colors"/>
                         <span>
                             <span className="block">Quick Generate</span>
-                            <span className="text-sm font-normal text-brand-light">Create members from archetypes.</span>
+                            <span className="text-sm font-normal text-brand-light group-hover:text-brand-primary transition-colors">Create members from templates and demographics.</span>
                         </span>
                     </button>
-                    <button onClick={() => setMode('questionnaire')} className="w-full text-left bg-brand-accent hover:bg-brand-light text-brand-text font-semibold py-3 px-5 rounded-lg transition-colors flex items-center space-x-4">
-                        <PlusCircleIcon className="h-6 w-6 text-brand-blue"/>
+                    <button onClick={() => setMode('questionnaire')} className="group w-full text-left bg-brand-accent hover:bg-brand-light text-brand-text hover:text-brand-primary font-semibold py-3 px-5 rounded-lg transition-colors flex items-center space-x-4">
+                        <PlusCircleIcon className="h-6 w-6 text-brand-blue group-hover:text-brand-primary transition-colors"/>
                         <span>
                             <span className="block">Create Detailed Member</span>
-                             <span className="text-sm font-normal text-brand-light">Craft a single founding member via questionnaire.</span>
+                             <span className="text-sm font-normal text-brand-light group-hover:text-brand-primary transition-colors">Craft a single founding member via questionnaire.</span>
                         </span>
                     </button>
                 </div>
@@ -151,7 +306,7 @@ const CreateSocietyModal: React.FC<{
 };
 
 
-const SocietyPage: React.FC<SocietyPageProps> = ({ societies, experiments, onAddSociety, onUpdateSociety, onDeleteSociety, navigateToExperiment, initialSocietyId, clearInitialSocietyId }) => {
+const SocietyPage: React.FC<SocietyPageProps> = ({ societies, experiments, userTemplates, onAddSociety, onUpdateSociety, onDeleteSociety, onAddTemplate, onUpdateTemplate, onDeleteTemplate, navigateToExperiment, navigateToDesignerWithSociety, initialSocietyId, clearInitialSocietyId }) => {
   const [selectedSocietyId, setSelectedSocietyId] = useState<string | null>(null);
   const [modal, setModal] = useState<'none' | 'create_society' | 'add_member_bulk' | 'add_member_detailed'>('none');
   const [isLoading, setIsLoading] = useState(false);
@@ -189,36 +344,41 @@ const SocietyPage: React.FC<SocietyPageProps> = ({ societies, experiments, onAdd
         if (choices.type === 'detailed') {
             setProgressMessage('Crafting initial member profile...');
             setProgressPercent(30);
-            const { name, ...profile } = await generateCognitiveProfile(choices.answers);
+            const { name, age, gender, expertise, ...profile } = await generateCognitiveProfile(choices.answers);
             const newMember: Member = {
-                id: `member-${Date.now()}`, name, role: Role.Citizen, profile,
+                id: `member-${Date.now()}`, name, role: LegacyRole.Citizen, profile, age, gender, expertise,
                 avatar: `https://api.dicebear.com/8.x/bottts-neutral/svg?seed=${name.replace(/\s/g, '')}`
             };
             members.push(newMember);
             setProgressPercent(60);
         } else if (choices.type === 'bulk') {
-            const archetypesToGenerate = ARCHETYPES.filter(a => choices.counts[a.name] > 0);
-            const totalSteps = archetypesToGenerate.length;
+            const allTemplates = [...DEFAULT_TEMPLATES, ...userTemplates];
+            const templatesToGenerate = allTemplates.filter(a => (choices.counts[a.name] || 0) > 0);
+            const totalSteps = templatesToGenerate.length;
             let currentMembers: Member[] = [];
 
-            for (const [index, archetype] of archetypesToGenerate.entries()) {
-                const count = choices.counts[archetype.name];
-                setProgressMessage(`Generating ${count} ${archetype.name} member(s)...`);
+            for (const [index, template] of templatesToGenerate.entries()) {
+                const count = choices.counts[template.name];
+                setProgressMessage(`Generating ${count} ${template.name} member(s)...`);
                 setProgressPercent(((index + 1) / (totalSteps + 1)) * 100);
                 
-                const profiles = await generateBulkProfiles(archetype, count);
-                const newMembers: Member[] = profiles.map((p, i) => ({
-                    id: `member-${Date.now()}-${archetype.name}-${i}`, name: p.name, role: Role.Citizen, profile: p,
-                    avatar: `https://api.dicebear.com/8.x/bottts-neutral/svg?seed=${p.name.replace(/\s/g, '')}`
-                }));
+                const profiles = await generateBulkProfiles(template, count, choices.config);
+                const newMembers: Member[] = profiles.map((p, i) => {
+                  const { name, age, gender, expertise, ...profile } = p;
+                  return {
+                      id: `member-${Date.now()}-${template.name}-${i}`, name, role: LegacyRole.Citizen, profile, age, gender, expertise,
+                      avatar: `https://api.dicebear.com/8.x/bottts-neutral/svg?seed=${p.name.replace(/\s/g, '')}`
+                  };
+                });
                 currentMembers.push(...newMembers);
             }
             members = currentMembers;
         }
 
-        setProgressMessage('Generating society name & description...');
-        const { name, description } = await generateSocietyNameAndDescription(members);
-        const newSociety: Society = { id: `soc-${Date.now()}`, name, description, members };
+        setProgressMessage('Analyzing society dynamics...');
+        const demographics = calculateDemographicSummary(members);
+        const { name, analysis } = await generateSocietyAnalysis(members, demographics);
+        const newSociety: Society = { id: `soc-${Date.now()}`, name, members, analysis };
         onAddSociety(newSociety);
         setProgressPercent(100);
 
@@ -229,20 +389,42 @@ const SocietyPage: React.FC<SocietyPageProps> = ({ societies, experiments, onAdd
     }
   };
 
+  const handleAnalyzeSociety = async () => {
+    if (!selectedSociety) return;
+    setIsLoading(true);
+    setLoadingMessage(`Analyzing "${selectedSociety.name}"...`);
+    setProgressPercent(50);
+    setProgressMessage('AI is analyzing society dynamics...');
+    try {
+        const demographics = calculateDemographicSummary(selectedSociety.members);
+        const { name, analysis } = await generateSocietyAnalysis(selectedSociety.members, demographics);
+        onUpdateSociety({ ...selectedSociety, name, analysis });
+        setProgressPercent(100);
+    } catch (error) {
+        console.error("Failed to analyze society:", error);
+    } finally {
+        setIsLoading(false);
+    }
+  };
+
   const handleAddMember = async (answers: Answer[]) => {
       if (!selectedSociety) return;
-      setLoadingMessage('Crafting AI Cognitive & Ethical Profile...');
+      setLoadingMessage('Crafting AI Character Profile...');
       setIsLoading(true);
       setModal('none');
       setProgressPercent(50);
       setProgressMessage('Generating profile...');
       try {
-          const { name, ...profile } = await generateCognitiveProfile(answers);
+          const { name, age, gender, expertise, ...profile } = await generateCognitiveProfile(answers);
           const newMember: Member = {
-              id: `member-${Date.now()}`, name, role: Role.Citizen, profile,
+              id: `member-${Date.now()}`, name, role: LegacyRole.Citizen, profile, age, gender, expertise,
               avatar: `https://api.dicebear.com/8.x/bottts-neutral/svg?seed=${name.replace(/\s/g, '')}`
           };
-          onUpdateSociety({ ...selectedSociety, members: [...selectedSociety.members, newMember] });
+          const updatedSociety = { ...selectedSociety, members: [...selectedSociety.members, newMember] };
+          // Re-analyze after adding member
+          const demographics = calculateDemographicSummary(updatedSociety.members);
+          const { name: newName, analysis } = await generateSocietyAnalysis(updatedSociety.members, demographics);
+          onUpdateSociety({ ...updatedSociety, name: newName, analysis });
           setProgressPercent(100);
       } catch (error) {
           console.error("Failed to create member:", error);
@@ -251,7 +433,7 @@ const SocietyPage: React.FC<SocietyPageProps> = ({ societies, experiments, onAdd
       }
   };
   
-  const handleBulkAddMembers = async (counts: Record<string, number>) => {
+  const handleBulkAddMembers = async (counts: Record<string, number>, config: BulkMemberConfig) => {
       if (!selectedSociety) return;
       const totalToGenerate = Object.values(counts).reduce((sum, count) => sum + (count || 0), 0);
       setLoadingMessage(`Generating ${totalToGenerate} New Members...`);
@@ -261,23 +443,33 @@ const SocietyPage: React.FC<SocietyPageProps> = ({ societies, experiments, onAdd
       setProgressMessage('');
       
       try {
-          const archetypesToGenerate = ARCHETYPES.filter(archetype => counts[archetype.name] > 0);
-          const totalSteps = archetypesToGenerate.length;
+          const allTemplates = [...DEFAULT_TEMPLATES, ...userTemplates];
+          const templatesToGenerate = allTemplates.filter(template => (counts[template.name] || 0) > 0);
+          const totalSteps = templatesToGenerate.length + 1; // +1 for final analysis
           let allNewMembers: Member[] = [];
           
-          for (const [index, archetype] of archetypesToGenerate.entries()) {
-              const count = counts[archetype.name];
+          for (const [index, template] of templatesToGenerate.entries()) {
+              const count = counts[template.name];
               setProgressPercent(((index + 1) / totalSteps) * 100);
-              setProgressMessage(`Generating ${count} ${archetype.name} member(s)...`);
+              setProgressMessage(`Generating ${count} ${template.name} member(s)...`);
               
-              const profiles = await generateBulkProfiles(archetype, count);
-              const newMembers: Member[] = profiles.map((profileData, index) => ({
-                  id: `member-${Date.now()}-${archetype.name}-${index}`, name: profileData.name, role: Role.Citizen, profile: profileData,
-                  avatar: `https://api.dicebear.com/8.x/bottts-neutral/svg?seed=${profileData.name.replace(/\s/g, '')}`
-              }));
+              const profiles = await generateBulkProfiles(template, count, config);
+              const newMembers: Member[] = profiles.map((p, i) => {
+                 const { name, age, gender, expertise, ...profile } = p;
+                 return {
+                    id: `member-${Date.now()}-${template.name}-${i}`, name, role: LegacyRole.Citizen, profile, age, gender, expertise,
+                    avatar: `https://api.dicebear.com/8.x/bottts-neutral/svg?seed=${p.name.replace(/\s/g, '')}`
+                 }
+              });
               allNewMembers = [...allNewMembers, ...newMembers];
           }
-          onUpdateSociety({ ...selectedSociety, members: [...selectedSociety.members, ...allNewMembers] });
+          const updatedMembers = [...selectedSociety.members, ...allNewMembers];
+          setProgressMessage('Re-analyzing society dynamics...');
+          const demographics = calculateDemographicSummary(updatedMembers);
+          const { name, analysis } = await generateSocietyAnalysis(updatedMembers, demographics);
+          onUpdateSociety({ ...selectedSociety, name, members: updatedMembers, analysis });
+          setProgressPercent(100);
+
       } catch (error) {
           console.error("Failed to bulk add members:", error);
       } finally {
@@ -286,25 +478,34 @@ const SocietyPage: React.FC<SocietyPageProps> = ({ societies, experiments, onAdd
       }
   };
 
-  const onRemoveMember = (memberId: string) => {
+  const onRemoveMember = async (memberId: string) => {
     if (!selectedSociety) return;
     const updatedMembers = selectedSociety.members.filter(m => m.id !== memberId);
-    onUpdateSociety({ ...selectedSociety, members: updatedMembers });
+    if(updatedMembers.length > 0) {
+        setIsLoading(true);
+        setLoadingMessage('Re-analyzing Society...');
+        const demographics = calculateDemographicSummary(updatedMembers);
+        const { name, analysis } = await generateSocietyAnalysis(updatedMembers, demographics);
+        onUpdateSociety({ ...selectedSociety, name, members: updatedMembers, analysis });
+        setIsLoading(false);
+    } else {
+        onUpdateSociety({ ...selectedSociety, members: [], analysis: undefined, name: `${selectedSociety.name} (Empty)` });
+    }
   };
   
   const onClearSocietyMembers = () => {
     if (!selectedSociety) return;
     if (window.confirm(`Are you sure you want to remove all members from "${selectedSociety.name}"? This cannot be undone.`)) {
-        onUpdateSociety({ ...selectedSociety, members: [] });
+        onUpdateSociety({ ...selectedSociety, members: [], analysis: undefined, name: `${selectedSociety.name} (Empty)` });
     }
   };
 
 
   return (
     <div className="min-h-screen p-4 sm:p-6 lg:p-8">
-      {modal === 'create_society' && <CreateSocietyModal onCancel={() => setModal('none')} startCreation={handleStartSocietyCreation} />}
+      {modal === 'create_society' && <CreateSocietyModal onCancel={() => setModal('none')} startCreation={handleStartSocietyCreation} userTemplates={userTemplates} onAddTemplate={onAddTemplate} onUpdateTemplate={onUpdateTemplate} />}
       {modal === 'add_member_detailed' && <Questionnaire onComplete={handleAddMember} onCancel={() => setModal('none')} />}
-      {modal === 'add_member_bulk' && <BulkCreateModal onCancel={() => setModal('none')} onGenerate={handleBulkAddMembers} title="Add Members" description="Add new members to the existing society." />}
+      {modal === 'add_member_bulk' && <BulkCreateModal onCancel={() => setModal('none')} onGenerate={handleBulkAddMembers} userTemplates={userTemplates} onAddTemplate={onAddTemplate} onUpdateTemplate={onUpdateTemplate} onDeleteTemplate={onDeleteTemplate} title="Add Members" description="Add new members to the existing society by specifying templates and demographics." />}
       
       {isLoading && (
         <div className="fixed inset-0 bg-black bg-opacity-75 flex flex-col items-center justify-center z-50 p-4">
@@ -372,12 +573,26 @@ const SocietyPage: React.FC<SocietyPageProps> = ({ societies, experiments, onAdd
             
             <div className="mb-8">
               <h1 className="text-4xl font-bold text-brand-text">{selectedSociety.name}</h1>
-              <div className="mt-3 p-4 bg-brand-secondary/50 rounded-lg border border-brand-accent/30 max-w-3xl">
-                <p className="text-lg text-brand-light">{selectedSociety.description}</p>
-              </div>
             </div>
+            
+            {selectedSociety.analysis ? (
+              <div className="mb-8">
+                <SocietyAnalysisDisplay analysis={selectedSociety.analysis} />
+              </div>
+            ) : (
+              <div className="my-8 p-6 bg-brand-accent/20 rounded-lg flex flex-col sm:flex-row items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-xl font-bold text-brand-text">Analysis Incomplete</h2>
+                  <p className="text-brand-light mt-1">This society was created with an older version. Run the new analysis to see its dynamics.</p>
+                </div>
+                <button onClick={handleAnalyzeSociety} className="bg-brand-blue text-brand-primary font-bold py-3 px-6 rounded-lg flex items-center shadow-lg hover:bg-opacity-90 transition-all transform hover:scale-105">
+                  <Wand2Icon className="h-5 w-5 mr-2" />
+                  Analyze Society
+                </button>
+              </div>
+            )}
 
-            {associatedExperiments.length > 0 && (
+            {associatedExperiments.length > 0 ? (
               <div className="mb-8 p-6 bg-brand-secondary/80 rounded-lg">
                 <h2 className="text-xl font-bold text-brand-text mb-4">Associated Experiments</h2>
                 <div className="space-y-3">
@@ -400,6 +615,17 @@ const SocietyPage: React.FC<SocietyPageProps> = ({ societies, experiments, onAdd
                     </button>
                   ))}
                 </div>
+              </div>
+            ) : (
+              <div className="my-8 p-6 bg-brand-accent/20 rounded-lg flex flex-col sm:flex-row items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-xl font-bold text-brand-text">Ready for Governance</h2>
+                  <p className="text-brand-light mt-1">This society is not part of any experiment. You can launch a new simulation using its members.</p>
+                </div>
+                <button onClick={() => navigateToDesignerWithSociety(selectedSociety.id)} className="bg-brand-blue text-brand-primary font-bold py-3 px-6 rounded-lg flex items-center shadow-lg hover:bg-opacity-90 transition-all transform hover:scale-105">
+                  <GavelIcon className="h-5 w-5 mr-2" />
+                  Run Experiment on this Society
+                </button>
               </div>
             )}
 

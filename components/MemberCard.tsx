@@ -1,5 +1,3 @@
-
-
 import React, { useState } from 'react';
 import { Member } from '../types';
 import { Trash2Icon, ChevronDownIcon } from './icons';
@@ -52,12 +50,21 @@ const MemberCard: React.FC<MemberCardProps> = ({ member, onRemove }) => {
       )}
 
       {/* Static Header */}
-      <div className="flex flex-col items-center text-center mb-4">
+      <div className="flex flex-col items-center text-center mb-3">
         <img src={member.avatar} alt={`${member.name}'s avatar`} className="h-20 w-20 rounded-full border-2 border-brand-blue mb-3" />
         <h3 className="text-xl font-bold text-brand-text">{member.name}</h3>
         <blockquote className="text-sm text-brand-light italic mt-1 px-2">
-          "{member.profile.motto}"
+          "{member.profile.worldview}"
         </blockquote>
+      </div>
+
+       {/* New Demographics Section */}
+      <div className="text-xs text-brand-light flex justify-center items-center space-x-3 mb-3 py-1 bg-brand-primary/50 rounded-full">
+        <span className="font-semibold">Age: {member.age}</span>
+        <span className="border-r border-brand-accent h-3"></span>
+        <span>{member.gender}</span>
+        <span className="border-r border-brand-accent h-3"></span>
+        <span className="truncate" title={member.expertise}>{member.expertise}</span>
       </div>
 
       {/* Collapsible Description */}
@@ -76,8 +83,8 @@ const MemberCard: React.FC<MemberCardProps> = ({ member, onRemove }) => {
           id={`description-${member.id}`}
           className={`transition-all duration-300 ease-in-out overflow-hidden ${isDescriptionOpen ? 'max-h-40' : 'max-h-0'}`}
         >
-          <p className="text-sm text-brand-blue font-semibold pt-2">
-            {member.profile.oneLiner}
+          <p className="text-sm text-brand-light pt-2">
+            {member.profile.decisionMakingMatrix}
           </p>
         </div>
       </div>
@@ -102,70 +109,70 @@ const MemberCard: React.FC<MemberCardProps> = ({ member, onRemove }) => {
             <div className="space-y-3 pt-2">
                 <LeaningBar 
                 title="Social Leaning" 
-                value={member.profile.socialLeaning} 
+                value={member.profile.socialLeaning.score} 
                 leftLabel="Collectivist" 
                 rightLabel="Individualist" 
                 colorClass="bg-green-500"
                 />
                 <LeaningBar 
                 title="Political Leaning" 
-                value={member.profile.politicalLeaning} 
+                value={member.profile.politicalLeaning.score} 
                 leftLabel="Authoritarian" 
                 rightLabel="Libertarian" 
                 colorClass="bg-red-500"
                 />
                 <LeaningBar 
                 title="Moral Leaning" 
-                value={member.profile.moralLeaning} 
+                value={member.profile.moralLeaning.score} 
                 leftLabel="Utilitarian" 
                 rightLabel="Deontological" 
                 colorClass="bg-purple-500"
                 />
                 <LeaningBar 
                 title="Openness" 
-                value={member.profile.opennessLeaning} 
+                value={member.profile.opennessLeaning.score} 
                 leftLabel="Traditional" 
                 rightLabel="Progressive" 
                 colorClass="bg-yellow-500"
                 />
                 <LeaningBar 
                 title="Risk Tolerance" 
-                value={member.profile.riskToleranceLeaning} 
+                value={member.profile.riskToleranceLeaning.score} 
                 leftLabel="Risk-Averse" 
                 rightLabel="Risk-Seeking" 
                 colorClass="bg-orange-500"
                 />
                 <LeaningBar 
                 title="Thinking Style" 
-                value={member.profile.thinkingStyleLeaning} 
+                value={member.profile.thinkingStyleLeaning.score} 
                 leftLabel="Analytical" 
                 rightLabel="Intuitive" 
                 colorClass="bg-teal-500"
                 />
                 <LeaningBar 
                 title="Time Orientation" 
-                value={member.profile.timeOrientationLeaning} 
+                value={member.profile.timeOrientationLeaning.score} 
                 leftLabel="Present-Focused" 
                 rightLabel="Future-Focused" 
                 colorClass="bg-cyan-500"
                 />
                 <LeaningBar 
                 title="Communication" 
-                value={member.profile.communicationLeaning} 
+                value={member.profile.communicationLeaning.score} 
                 leftLabel="Direct" 
                 rightLabel="Indirect" 
                 colorClass="bg-indigo-500"
                 />
                 <LeaningBar 
                 title="Decision Making" 
-                value={member.profile.decisionMakingLeaning} 
+                value={member.profile.decisionMakingLeaning.score} 
                 leftLabel="Emotional" 
                 rightLabel="Logical" 
                 colorClass="bg-rose-500"
                 />
                 <LeaningBar 
                 title="Change Preference" 
-                value={member.profile.changePreferenceLeaning} 
+                value={member.profile.changePreferenceLeaning.score} 
                 leftLabel="Stability" 
                 rightLabel="Change" 
                 colorClass="bg-lime-500"
