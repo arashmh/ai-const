@@ -3,7 +3,11 @@
 # AI Constitution Simulator
 
 
-<p style="font-size: 1.2em;">Above a certain threshold of agency, systems (including humans and future artificial intelligences) cannot simply be aligned by external forces. Instead, they must choose their own values and align themselves, often by discovering shared purposes that create new, emergent forms of collective agency. Alignment, therefore, is not just about imposing goals, but about building systems that can recognize and participate in shared purposes.</p>
+<p style="font-size: 1.1em;">Above a certain threshold of agency, systems (including humans and future artificial intelligences) cannot simply be aligned by external forces. Instead, they must choose their own values and align themselves, often by discovering shared purposes that create new, emergent forms of collective agency. Alignment, therefore, is not just about imposing goals, but about building systems that can recognize and participate in shared purposes.</p>
+
+<p style="font-size: 1.1em;">This raises questions about how to convince such agents to develop purposes that are compatible with human well-being, and how to negotiate shared agency between humans and machines.</p>
+
+
 <br>
 
 
